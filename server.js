@@ -86,23 +86,72 @@ app.get('/api/branches/:bid', async (req, res) => {
 });
 
 // สร้าง/บันทึกสาขา (คนละแถว คนละ row-lock — สาขาอื่นไม่ถูกกระทบเด็ดขาด)
+// รองรับ optimistic concurrency ผ่าน expectedRev: ถ้าไคลเอนต์ส่ง expectedRev มาและไม่ตรงกับ rev
+// ปัจจุบันในฐานข้อมูล (แปลว่ามีคนอื่นแก้ไปแล้วระหว่างที่เราถืออันเก่าอยู่) จะปฏิเสธด้วย 409 พร้อมข้อมูลล่าสุด
+// แทนที่จะเขียนทับเงียบๆ ให้ของเก่ากว่าไปทับของใหม่กว่าโดยไม่รู้ตัว
 app.put('/api/branches/:bid', async (req, res) => {
   const { bid } = req.params;
-  const { name, payload, updatedBy } = req.body || {};
+  const { name, payload, updatedBy, expectedRev } = req.body || {};
   if (!name || !payload) return res.status(400).json({ error: 'ข้อมูลไม่ครบ' });
+  const client = await pool.connect();
   try {
-    const r = await pool.query(
+    await client.query('BEGIN');
+    const cur = await client.query('SELECT rev, payload FROM branches WHERE bid=$1 FOR UPDATE', [bid]);
+    if (cur.rows.length && expectedRev != null && cur.rows[0].rev !== expectedRev) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'ข้อมูลสาขานี้ถูกแก้ไขจากเครื่องอื่นไปแล้วระหว่างที่คุณกำลังแก้ กรุณาลองใหม่',
+        current: { bid, name: cur.rows[0].name, payload: cur.rows[0].payload, rev: cur.rows[0].rev }
+      });
+    }
+    const nextRev = (cur.rows[0]?.rev || 0) + 1;
+    const upd = await client.query(
       `INSERT INTO branches (bid, name, payload, rev, updated_by, updated_at, created_at)
        VALUES ($1,$2,$3,1,$4,now(),now())
-       ON CONFLICT (bid) DO UPDATE SET name=$2, payload=$3, rev=branches.rev+1, updated_by=$4, updated_at=now()
+       ON CONFLICT (bid) DO UPDATE SET name=$2, payload=$3, rev=$5, updated_by=$4, updated_at=now()
        RETURNING bid, name, payload, rev, updated_at`,
-      [bid, name, JSON.stringify(payload), updatedBy || null]
+      [bid, name, JSON.stringify(payload), updatedBy || null, nextRev]
     );
-    const row = r.rows[0];
+    await client.query('COMMIT');
+    const row = upd.rows[0];
     io.to('branch:' + bid).emit('branch:update', { ...row, updatedBy: updatedBy || null });
     io.to('admin').emit('branches:changed', { type: 'upsert', bid, name: row.name });
     res.json(row);
-  } catch (e) { console.error(e); res.status(500).json({ error: 'บันทึกสาขาไม่สำเร็จ' }); }
+  } catch (e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'บันทึกสาขาไม่สำเร็จ' }); }
+  finally { client.release(); }
+});
+
+// อัปเดตเฉพาะ "รอบนับสต๊อก" ของวัน/รอบเดียว แบบ path-level merge ภายใต้ row lock
+// จุดสำคัญ: endpoint นี้จะไม่แตะ arrange/catalog/shelfNames/ฯลฯ ของ payload เลย ต่อให้ต้นทางที่ส่งมา
+// (ฝั่งพนักงานนับสต๊อก) จะถือสำเนา payload เก่ากว่าฝั่งอื่นอยู่ก็ตาม — จึงไม่มีทางที่การยืนยันรอบนับ
+// จะไปเขียนทับการแก้ผัง/แคตตาล็อกที่ฝั่งแอดมินเพิ่งบันทึกพร้อมกัน และในทางกลับกัน การแก้ผังฝั่งแอดมิน
+// ก็ไม่มีทางไปเขียนทับรอบนับที่เพิ่งยืนยันเช่นกัน เพราะทั้งสองฝั่งแก้กันคนละ path ใน payload เดียวกัน
+app.put('/api/branches/:bid/round', async (req, res) => {
+  const { bid } = req.params;
+  const { date, round, session, updatedBy } = req.body || {};
+  if (!date || !round || !session) return res.status(400).json({ error: 'ข้อมูลไม่ครบ' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const cur = await client.query('SELECT payload, rev FROM branches WHERE bid=$1 FOR UPDATE', [bid]);
+    if (!cur.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'ไม่พบสาขานี้' }); }
+    const payload = cur.rows[0].payload || {};
+    payload.rounds = payload.rounds || {};
+    payload.rounds[date] = payload.rounds[date] || {};
+    payload.rounds[date][round] = session; // ทับเฉพาะรอบนับของวัน/รอบนี้เท่านั้น ส่วนอื่นของ payload คงเดิมตามที่อยู่ในฐานข้อมูลล่าสุด
+    const nextRev = (cur.rows[0].rev || 0) + 1;
+    const upd = await client.query(
+      `UPDATE branches SET payload=$1, rev=$2, updated_by=$3, updated_at=now() WHERE bid=$4
+       RETURNING bid, name, payload, rev, updated_at`,
+      [JSON.stringify(payload), nextRev, updatedBy || null, bid]
+    );
+    await client.query('COMMIT');
+    const row = upd.rows[0];
+    io.to('branch:' + bid).emit('branch:update', { ...row, updatedBy: updatedBy || null });
+    io.to('admin').emit('branches:changed', { type: 'upsert', bid, name: row.name });
+    res.json(row);
+  } catch (e) { await client.query('ROLLBACK'); console.error(e); res.status(500).json({ error: 'บันทึกรอบนับไม่สำเร็จ' }); }
+  finally { client.release(); }
 });
 
 // ลบสาขา → ย้ายเข้าถังขยะ (ไม่ลบจริง)
