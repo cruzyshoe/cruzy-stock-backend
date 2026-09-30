@@ -104,6 +104,31 @@ app.put('/api/branches/:bid', async (req, res) => {
         current: { bid, name: cur.rows[0].name, payload: cur.rows[0].payload, rev: cur.rows[0].rev }
       });
     }
+    // ตาข่ายนิรภัยชั้นสอง (กันเหตุการณ์ "รอบนับที่ยืนยันแล้วหายไป"): ถ้าเครื่องที่ยิง PUT นี้เข้ามา
+    // ถืองสำเนา JS เก่า (เช่นแคชหน้าเว็บค้างจากก่อนอัปเดต) จะไม่ส่ง expectedRev มาเลย ทำให้ผ่านเช็คด้านบนไปได้
+    // แม้ payload ทั้งก้อนที่ส่งมาจะเก่ากว่าของในฐานข้อมูลก็ตาม — จุดนี้จึงตรวจซ้ำเฉพาะส่วน "รอบนับ" อีกชั้น:
+    // ถ้าฐานข้อมูลปัจจุบันมีรอบนับใดที่ "ยืนยันแล้ว" (confirmed:true) อยู่ก่อน จะไม่มีทางถูกเขียนทับให้กลับไป
+    // เป็นยังไม่ยืนยัน/หายไปได้เด็ดขาด เว้นแต่ของที่ส่งมาใหม่จะยืนยันเช่นกันและมีเวลายืนยัน (t) ใหม่กว่าจริง
+    // (กรณีนับใหม่ทับของเดิมโดยตั้งใจ) — วิธีนี้ปกป้องข้อมูลรอบนับได้แม้ไคลเอนต์บางเครื่องยังไม่ได้อัปเดตโค้ด
+    if (cur.rows.length && cur.rows[0].payload && cur.rows[0].payload.rounds) {
+      const dbRounds = cur.rows[0].payload.rounds;
+      payload.rounds = payload.rounds || {};
+      for (const d of Object.keys(dbRounds)) {
+        const dbDay = dbRounds[d] || {};
+        for (const r of Object.keys(dbDay)) {
+          const dbSess = dbDay[r];
+          if (dbSess && dbSess.confirmed) {
+            const incomingDay = payload.rounds[d] || {};
+            const incoming = incomingDay[r];
+            const incomingNewer = !!(incoming && incoming.confirmed && incoming.t && dbSess.t && new Date(incoming.t) > new Date(dbSess.t));
+            if (!incomingNewer) {
+              payload.rounds[d] = payload.rounds[d] || {};
+              payload.rounds[d][r] = dbSess;
+            }
+          }
+        }
+      }
+    }
     const nextRev = (cur.rows[0]?.rev || 0) + 1;
     const upd = await client.query(
       `INSERT INTO branches (bid, name, payload, rev, updated_by, updated_at, created_at)
