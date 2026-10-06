@@ -26,12 +26,23 @@ app.get('/api/meta', async (req, res) => {
   } catch (e) { console.error(e); res.status(500).json({ error: 'อ่านข้อมูลกลางไม่สำเร็จ' }); }
 });
 
+// รองรับ optimistic concurrency ผ่าน expectedRev เหมือน PUT /api/branches/:bid — ก่อนหน้านี้ endpoint นี้
+// เขียนทับข้อมูลกลาง (รายการสินค้า/สี/รหัส SKU ที่ใช้ร่วมทุกสาขา) ทั้งก้อนแบบไม่มีการเช็คใดๆ เลย
+// ทำให้ถ้ามีหน้าจอแอดมิน/เครื่องไหนเปิดค้างไว้นานถือสำเนาเก่ากว่าอยู่ แล้วมีการ push ใดๆ ที่พ่วง pushMeta()
+// มาด้วย (เช่นแค่บันทึก log ปกติ) จะไปเขียนทับรายการสินค้าที่เพิ่งเพิ่มจากเครื่องอื่นให้หายไปเงียบๆ ได้
 app.put('/api/meta', async (req, res) => {
-  const { products, custColors, skuCodes, skuNames, siteUrl, trashRetentionDays, newLogs, updatedBy } = req.body || {};
+  const { products, custColors, skuCodes, skuNames, siteUrl, trashRetentionDays, newLogs, updatedBy, expectedRev } = req.body || {};
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const cur = await client.query('SELECT rev FROM meta WHERE id=1 FOR UPDATE');
+    const cur = await client.query('SELECT * FROM meta WHERE id=1 FOR UPDATE');
+    if (cur.rows.length && expectedRev != null && cur.rows[0].rev !== expectedRev) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        error: 'ข้อมูลสินค้ากลางถูกแก้ไขจากเครื่องอื่นไปแล้วระหว่างที่คุณกำลังแก้ กรุณาลองใหม่',
+        current: cur.rows[0]
+      });
+    }
     const nextRev = (cur.rows[0]?.rev || 0) + 1;
     const upd = await client.query(
       `UPDATE meta SET products=$1, cust_colors=$2, sku_codes=$3, sku_names=$4, site_url=$5,
