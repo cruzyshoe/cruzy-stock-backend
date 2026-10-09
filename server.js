@@ -18,6 +18,20 @@ const io = new Server(server, { cors: { origin: '*' } });
 
 function nowIso() { return new Date().toISOString(); }
 
+// เปลี่ยนค่าทุกครั้งที่ deploy ใหม่โดยอัตโนมัติ (เวลาที่โปรเซสเริ่มทำงาน) — ใช้ให้ฝั่งแอปรู้ว่ามีอัปเดตใหม่
+// เพื่อเตือนให้รีเฟรชหน้า กันเครื่องที่เปิดค้างไว้นานๆ ใช้โค้ดเก่าโดยไม่รู้ตัว (ต้นเหตุหลักของปัญหาข้อมูลหายที่ผ่านมา)
+const APP_VERSION = nowIso();
+app.get('/api/version', (req, res) => res.json({ version: APP_VERSION }));
+
+// บันทึก log เมื่อระบบป้องกันการเขียนทับ (ชั้นที่ 2/3 ใน PUT /api/branches/:bid) ทำงานจริง — ก่อนหน้านี้ระบบ
+// ป้องกันเงียบๆ ไม่มีร่องรอยให้เห็นเลยว่าเคยมีเหตุการณ์แบบนี้เกิดขึ้น ทำให้ต้องมานั่งสืบสาเหตุย้อนหลังทีหลัง
+// ฟังก์ชันนี้แค่ insert เข้าตาราง logs ตัวเดียวกับที่หน้า "ประวัติการแก้ไข" ใช้แสดงอยู่แล้ว ไม่ต้องรอ await
+function logGuardTriggered(branchName, detail) {
+  pool.query('INSERT INTO logs (t, who, branch, action, detail) VALUES ($1,$2,$3,$4,$5)',
+    [nowIso(), 'ระบบ', branchName || '', 'ป้องกันข้อมูลถูกเขียนทับ', detail]
+  ).catch(e => console.error('บันทึก log การป้องกันข้อมูลไม่สำเร็จ', e));
+}
+
 /* ---------- meta ---------- */
 app.get('/api/meta', async (req, res) => {
   try {
@@ -135,6 +149,7 @@ app.put('/api/branches/:bid', async (req, res) => {
             if (!incomingNewer) {
               payload.rounds[d] = payload.rounds[d] || {};
               payload.rounds[d][r] = dbSess;
+              logGuardTriggered(name, 'กันรอบนับ ' + d + ' · ' + r + ' ที่ยืนยันแล้วไม่ให้ถูกเขียนทับ (เครื่องที่ส่งมาอาจถือข้อมูลเก่ากว่า)');
             }
           }
         }
@@ -162,6 +177,7 @@ app.put('/api/branches/:bid', async (req, res) => {
         payload.arrange = dbPayload.arrange;
         payload.shelfNames = dbPayload.shelfNames;
         if (dbPayload.catalog && Object.keys(dbPayload.catalog).length) payload.catalog = dbPayload.catalog;
+        logGuardTriggered(name, 'กันผังสินค้า (' + dbCount + ' รายการ) ไม่ให้ถูกเขียนทับด้วยผังว่างเปล่า (เครื่องที่ส่งมาอาจโหลดข้อมูลไม่สำเร็จ)');
       }
     }
     const nextRev = (cur.rows[0]?.rev || 0) + 1;
