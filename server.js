@@ -140,6 +140,30 @@ app.put('/api/branches/:bid', async (req, res) => {
         }
       }
     }
+    // ตาข่ายนิรภัยชั้นสาม (กันเหตุการณ์ "ตั้งผังสินค้าไว้แล้วหายไปทั้งหมด"): ผังสินค้า (arrange/shelfNames/catalog)
+    // เป็นข้อมูลที่พนักงานกรอกเองทีละชิ้น ไม่มีทางที่จะว่างเปล่าทั้งหมดเองได้ถ้าก่อนหน้านี้เคยมีของอยู่แล้ว
+    // ถ้าฐานข้อมูลปัจจุบันมีสินค้าตั้งผังไว้อยู่ (arrange มีของจริง) แต่ payload ที่ส่งมาใหม่กลับว่างเปล่าสนิท
+    // (เช่นเครื่องที่โหลดสาขานี้ไม่สำเร็จ/หมดเวลาแล้ว fallback สร้างสาขาเปล่าขึ้นมาแทน ตามที่ loadSingleBranch ทำ
+    // แล้วบังเอิญมีการ push ทับออกไป) จะไม่เขียนทับผังเดิมให้หายไปเด็ดขาด เก็บผังเดิมของฐานข้อมูลไว้แทน
+    if (cur.rows.length && cur.rows[0].payload) {
+      const dbPayload = cur.rows[0].payload;
+      const countArrangeItems = (arr) => {
+        let n = 0;
+        if (Array.isArray(arr)) arr.forEach(shelf => {
+          if (Array.isArray(shelf)) shelf.forEach(bar => {
+            if (Array.isArray(bar)) bar.forEach(hook => { if (Array.isArray(hook)) n += hook.length; });
+          });
+        });
+        return n;
+      };
+      const dbCount = countArrangeItems(dbPayload.arrange);
+      const incomingCount = countArrangeItems(payload.arrange);
+      if (dbCount > 0 && incomingCount === 0) {
+        payload.arrange = dbPayload.arrange;
+        payload.shelfNames = dbPayload.shelfNames;
+        if (dbPayload.catalog && Object.keys(dbPayload.catalog).length) payload.catalog = dbPayload.catalog;
+      }
+    }
     const nextRev = (cur.rows[0]?.rev || 0) + 1;
     const upd = await client.query(
       `INSERT INTO branches (bid, name, payload, rev, updated_by, updated_at, created_at)
